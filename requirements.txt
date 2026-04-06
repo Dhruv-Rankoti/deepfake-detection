@@ -2,7 +2,7 @@
 torch
 torchvision
 timm
-opencv-python
+opencv-python-headless
 Pillow
 numpy
 lime
