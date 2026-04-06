@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch
+torchvision
+timm
+opencv-python
+Pillow
+numpy
+lime
+matplotlib
+streamlit
+scikit-image
