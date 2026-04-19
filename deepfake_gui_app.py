@@ -2,9 +2,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Deepfake Detection System — Streamlit GUI
 #
-# Label convention (matches training notebook v3):
-#   model output index 0  →  FAKE
-#   model output index 1  →  REAL
+# Built to match deepfake-detection-metrics.ipynb exactly:
+#   • ViT-Base/16  — EPOCHS=10, TRAIN_LIMIT=None (full 100k)
+#   • U-Net        — EPOCHS=5,  trained with nn.DataParallel on 2×T4
+#   • Label map    — index 0 = FAKE,  index 1 = REAL
+#   • clf transform  — Resize → ToTensor → Normalize([0.5],[0.5])
+#   • seg transform  — Resize → ToTensor  (NO normalization, matches notebook)
+#   • DataParallel strip — unet.pth saved from DataParallel model, so
+#                          'module.' prefix is stripped on load automatically
 #
 # Requirements:
 #   pip install streamlit torch torchvision timm opencv-python lime
@@ -35,7 +40,7 @@ from torchvision import transforms
 from timm import create_model
 import streamlit as st
 
-# ─── Optional LIME (slow but available) ──────────────────────────────────────
+# ── Optional LIME ─────────────────────────────────────────────────────────────
 try:
     from lime import lime_image
     from skimage.segmentation import mark_boundaries
@@ -44,25 +49,26 @@ except ImportError:
     LIME_AVAILABLE = False
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG  — must match notebook exactly
 # ═════════════════════════════════════════════════════════════════════════════
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE = 224
 
-# label index → human label  (matches training notebook v3)
+# Confirmed from notebook cell 11: LABEL_MAP = {1: 'REAL', 0: 'FAKE'}
 LABEL_MAP = {0: "FAKE", 1: "REAL"}
 
 WEIGHTS_DIR = os.path.dirname(os.path.abspath(__file__))
 VIT_PATH    = os.path.join(WEIGHTS_DIR, "vit.pth")
 UNET_PATH   = os.path.join(WEIGHTS_DIR, "unet.pth")
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-# MODELS
+# MODELS  — identical to notebook cell 18
 # ═════════════════════════════════════════════════════════════════════════════
 class ViTClassifier(nn.Module):
     """
-    ViT-Base/16 fine-tuned for binary deepfake classification.
-    Output: logits [batch, 2]  — index 0 = FAKE, index 1 = REAL
+    Pretrained ViT-Base/16 fine-tuned for binary classification.
+    Output logits: [batch, 2]  — index 0=FAKE, index 1=REAL
     """
     def __init__(self, num_classes: int = 2):
         super().__init__()
@@ -94,8 +100,8 @@ class DoubleConv(nn.Module):
 
 class UNet(nn.Module):
     """
-    3-level U-Net for tampered-region segmentation.
-    Output: sigmoid mask [batch, 1, H, W]  — high values = likely tampered
+    3-level U-Net — identical architecture to notebook cell 18.
+    Output: sigmoid mask [batch, 1, H, W]
     """
     def __init__(self):
         super().__init__()
@@ -124,23 +130,45 @@ class UNet(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LOAD MODELS  (cached so they load only once per session)
+# LOAD MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL: The notebook trained both models inside nn.DataParallel (2×T4).
+# torch.save() on a DataParallel model stores keys with a "module." prefix,
+# e.g. "module.enc1.block.0.weight" instead of "enc1.block.0.weight".
+# _strip_dataparallel() removes that prefix so the weights load cleanly into
+# the plain ViTClassifier / UNet classes defined above.
 # ═════════════════════════════════════════════════════════════════════════════
+def _strip_dataparallel(state_dict: dict) -> dict:
+    """Remove 'module.' prefix from every key (saved by nn.DataParallel)."""
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_key = k[len("module."):] if k.startswith("module.") else k
+        cleaned[new_key] = v
+    return cleaned
+
+
 @st.cache_resource(show_spinner=False)
 def load_models():
     clf = ViTClassifier().to(DEVICE)
     seg = UNet().to(DEVICE)
-
     clf_loaded = False
     seg_loaded = False
 
     if os.path.exists(VIT_PATH):
-        clf.load_state_dict(torch.load(VIT_PATH, map_location=DEVICE))
-        clf_loaded = True
+        try:
+            sd = torch.load(VIT_PATH, map_location=DEVICE)
+            clf.load_state_dict(_strip_dataparallel(sd))
+            clf_loaded = True
+        except Exception as e:
+            st.warning(f"Could not load vit.pth: {e}")
 
     if os.path.exists(UNET_PATH):
-        seg.load_state_dict(torch.load(UNET_PATH, map_location=DEVICE))
-        seg_loaded = True
+        try:
+            sd = torch.load(UNET_PATH, map_location=DEVICE)
+            seg.load_state_dict(_strip_dataparallel(sd))
+            seg_loaded = True
+        except Exception as e:
+            st.warning(f"Could not load unet.pth: {e}")
 
     clf.eval()
     seg.eval()
@@ -148,7 +176,11 @@ def load_models():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TRANSFORMS
+# TRANSFORMS  — must match notebook inference transforms exactly
+# ─────────────────────────────────────────────────────────────────────────────
+# Notebook cell 36:
+#   clf_infer_tf = Resize(224) → ToTensor → Normalize([0.5]*3, [0.5]*3)
+#   seg_infer_tf = Resize(224) → ToTensor          ← NO normalization
 # ═════════════════════════════════════════════════════════════════════════════
 clf_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -159,6 +191,7 @@ clf_transform = transforms.Compose([
 seg_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
+    # No Normalize — intentional, matches seg_infer_tf in notebook cell 36
 ])
 
 
@@ -169,8 +202,8 @@ def classify(clf: nn.Module, img: Image.Image):
     """
     Returns:
         label (str)  : 'REAL' or 'FAKE'
-        conf  (float): confidence in the predicted label  [0, 1]
-        probs (array): full softmax probabilities [p_fake, p_real]
+        conf  (float): confidence in the predicted label [0, 1]
+        probs (array): [p_fake, p_real]
     """
     t = clf_transform(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
@@ -183,28 +216,29 @@ def classify(clf: nn.Module, img: Image.Image):
 
 
 def segment(seg: nn.Module, img: Image.Image) -> np.ndarray:
-    """Returns a float32 mask [H, W] in [0, 1]."""
+    """Returns float32 mask [H, W] in [0, 1]."""
     t = seg_transform(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        mask = seg(t).cpu().squeeze().numpy()
+        out = seg(t)
+    # squeeze handles both [1,1,H,W] and [1,H,W] gracefully
+    mask = out.cpu().squeeze().numpy()
     return mask
 
 
 def build_overlay(img_np: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Blend a red heat overlay onto the image using the mask as alpha."""
-    heatmap = cm.hot(mask)[:, :, :3]           # [H, W, 3] float64  0-1
+    """Blend a hot-colormap heat overlay onto the image using the mask as alpha."""
+    heatmap = cm.hot(mask)[:, :, :3]            # [H,W,3] float in [0,1]
     heatmap = (heatmap * 255).astype(np.uint8)
-
-    alpha   = (mask * 0.6).clip(0, 0.6)        # max 60 % opacity
-    alpha   = alpha[:, :, np.newaxis]
-
-    overlay = (img_np.astype(np.float32) * (1 - alpha)
-               + heatmap.astype(np.float32) * alpha).astype(np.uint8)
+    alpha   = (mask * 0.6).clip(0, 0.6)[:, :, np.newaxis]
+    overlay = (
+        img_np.astype(np.float32) * (1 - alpha)
+        + heatmap.astype(np.float32) * alpha
+    ).astype(np.uint8)
     return overlay
 
 
 def mask_to_heatmap_image(mask: np.ndarray) -> Image.Image:
-    """Convert a float32 mask to a PIL image using the 'hot' colormap."""
+    """Convert float32 [H,W] mask → PIL RGB image via 'hot' colormap."""
     fig, ax = plt.subplots(figsize=(3, 3))
     ax.imshow(mask, cmap="hot", vmin=0, vmax=1)
     ax.axis("off")
@@ -216,20 +250,22 @@ def mask_to_heatmap_image(mask: np.ndarray) -> Image.Image:
     return Image.open(buf).convert("RGB")
 
 
-def run_lime(clf: nn.Module, img_np: np.ndarray, num_samples: int = 200):
+def run_lime(clf: nn.Module, img_np: np.ndarray, num_samples: int = 300):
     """
-    Returns (lime_temp, lime_mask, label_name) or raises if LIME not available.
-    img_np : uint8 [H, W, 3]
+    LIME explanation matching notebook cell 38 exactly:
+        images (uint8) → /255 → (x-0.5)/0.5 → DEVICE → softmax
+    Returns (lime_temp, lime_mask_arr, label_name).
     """
     def predict_fn(images):
+        # LIME passes uint8 numpy [N, H, W, 3]
         t = torch.from_numpy(images).permute(0, 3, 1, 2).float() / 255.0
-        t = (t - 0.5) / 0.5
+        t = (t - 0.5) / 0.5      # identical normalization to clf training
         t = t.to(DEVICE)
         clf.eval()
         with torch.no_grad():
             out   = clf(t)
             probs = torch.softmax(out, dim=1).cpu().numpy()
-        return probs  # [N, 2]
+        return probs   # [N, 2]  index 0=FAKE, 1=REAL
 
     explainer   = lime_image.LimeImageExplainer()
     explanation = explainer.explain_instance(
@@ -244,7 +280,7 @@ def run_lime(clf: nn.Module, img_np: np.ndarray, num_samples: int = 200):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG & CUSTOM CSS
+# PAGE CONFIG & CSS
 # ═════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="Deepfake Detector",
@@ -257,28 +293,23 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Rajdhani', sans-serif;
-}
+html, body, [class*="css"] { font-family: 'Rajdhani', sans-serif; }
 
-/* Dark terminal background */
 .stApp {
     background-color: #0a0c10;
     color: #c9d1d9;
 }
-
-/* Sidebar */
 [data-testid="stSidebar"] {
     background-color: #0d1117;
     border-right: 1px solid #21262d;
 }
-
-/* Title */
-h1 { font-family: 'Share Tech Mono', monospace !important;
-     color: #58a6ff !important; letter-spacing: 2px; }
+h1 {
+    font-family: 'Share Tech Mono', monospace !important;
+    color: #58a6ff !important;
+    letter-spacing: 2px;
+}
 h2, h3 { color: #e6edf3 !important; }
 
-/* Metric cards */
 [data-testid="metric-container"] {
     background: #161b22;
     border: 1px solid #21262d;
@@ -286,7 +317,6 @@ h2, h3 { color: #e6edf3 !important; }
     padding: 12px 16px;
 }
 
-/* REAL badge */
 .badge-real {
     display: inline-block;
     background: #0d3b1e;
@@ -298,8 +328,6 @@ h2, h3 { color: #e6edf3 !important; }
     font-size: 1.4rem;
     letter-spacing: 3px;
 }
-
-/* FAKE badge */
 .badge-fake {
     display: inline-block;
     background: #3b0d0d;
@@ -312,7 +340,6 @@ h2, h3 { color: #e6edf3 !important; }
     letter-spacing: 3px;
 }
 
-/* Confidence bar track */
 .conf-track {
     background: #21262d;
     border-radius: 4px;
@@ -323,10 +350,8 @@ h2, h3 { color: #e6edf3 !important; }
 .conf-fill-real { background: #3fb950; border-radius: 4px; height: 10px; }
 .conf-fill-fake { background: #f85149; border-radius: 4px; height: 10px; }
 
-/* Divider */
 hr { border-color: #21262d !important; }
 
-/* Button */
 .stButton > button {
     background: #1f6feb;
     color: white;
@@ -341,10 +366,8 @@ hr { border-color: #21262d !important; }
 }
 .stButton > button:hover { background: #388bfd; }
 
-/* Warning / info boxes */
 .stAlert { border-radius: 6px !important; }
 
-/* Image captions */
 .caption {
     font-family: 'Share Tech Mono', monospace;
     font-size: 0.75rem;
@@ -382,32 +405,54 @@ with st.sidebar:
     if clf_loaded:
         st.success("✅ ViT weights loaded  (`vit.pth`)")
     else:
-        st.warning("⚠️ `vit.pth` not found — random weights")
+        st.warning("⚠️ `vit.pth` not found — using random weights")
 
     if seg_loaded:
         st.success("✅ U-Net weights loaded  (`unet.pth`)")
     else:
-        st.warning("⚠️ `unet.pth` not found — random weights")
+        st.warning("⚠️ `unet.pth` not found — using random weights")
 
     st.markdown(f"🖥️ Device: **{DEVICE.upper()}**")
 
     st.markdown("---")
     st.markdown("### Analysis Options")
-    show_mask  = st.checkbox("Show tampered region mask", value=True)
-    show_lime  = st.checkbox(
-        "Show LIME explanation  (slow ~1 min)",
+
+    show_mask = st.checkbox("Show tampered region mask", value=True)
+    show_lime = st.checkbox(
+        "Show LIME explanation  (slow ~1–2 min)",
         value=False,
         disabled=not LIME_AVAILABLE,
-        help="Requires the `lime` package." if not LIME_AVAILABLE else "",
+        help="Install the `lime` package to enable." if not LIME_AVAILABLE else "",
     )
-    lime_samples = 200
+    lime_samples = 300   # default matches notebook (num_samples=300)
     if show_lime and LIME_AVAILABLE:
-        lime_samples = st.slider("LIME samples", 100, 500, 200, step=50)
+        lime_samples = st.slider("LIME samples", 100, 500, 300, step=50)
 
     st.markdown("---")
     st.markdown(
-        "<small style='color:#8b949e'>Label convention:<br>"
-        "model idx 0 = FAKE<br>model idx 1 = REAL</small>",
+        "<small style='color:#8b949e'>"
+        "Label convention:<br>"
+        "model idx&nbsp;0 = FAKE<br>"
+        "model idx&nbsp;1 = REAL"
+        "</small>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Trained model metrics for reference ─────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Trained Model Metrics")
+    st.markdown(
+        "<small style='color:#8b949e'>"
+        "<b style='color:#e6edf3'>ViT Classifier</b> (test, n=20 000)<br>"
+        "Accuracy &nbsp;: 0.9911<br>"
+        "F1 Score &nbsp;: 0.9911<br>"
+        "ROC-AUC &nbsp;: 0.9995<br>"
+        "<br>"
+        "<b style='color:#e6edf3'>U-Net Segmentation</b> (val)<br>"
+        "Pixel Acc : 92.80%<br>"
+        "Mean IoU &nbsp;: 0.6013<br>"
+        "Dice Coef : 0.7452<br>"
+        "</small>",
         unsafe_allow_html=True,
     )
 
@@ -427,20 +472,21 @@ st.markdown("---")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# HELPER: render one complete analysis
+# RENDER ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 def render_analysis(image: Image.Image):
-    """Run and display full analysis for a PIL image."""
+    """Run full pipeline and display results for one PIL image."""
 
     img_resized = image.resize((IMG_SIZE, IMG_SIZE))
-    img_np      = np.array(img_resized)
+    img_np      = np.array(img_resized)   # uint8 [H, W, 3]
 
-    # ── Run models ───────────────────────────────────────────────
+    # ── Classification ───────────────────────────────────────────
     with st.spinner("Classifying…"):
         t0 = time.time()
         label, conf, probs = classify(clf_model, image)
         clf_time = time.time() - t0
 
+    # ── Segmentation ─────────────────────────────────────────────
     mask     = None
     seg_time = 0.0
     if show_mask:
@@ -449,12 +495,12 @@ def render_analysis(image: Image.Image):
             mask     = segment(seg_model, image)
             seg_time = time.time() - t0
 
-    # ── Layout: image | result ───────────────────────────────────
+    # ── Layout: image | verdict ──────────────────────────────────
     col_img, col_res = st.columns([1, 1], gap="large")
 
     with col_img:
         st.markdown("#### Input Image")
-        st.image(image, width='stretch')
+        st.image(image, use_container_width=True)
 
     with col_res:
         st.markdown("#### Prediction")
@@ -492,23 +538,25 @@ def render_analysis(image: Image.Image):
         c1, c2, c3 = st.columns(3)
 
         with c1:
-            st.image(image.resize((IMG_SIZE, IMG_SIZE)), width='stretch')
+            st.image(img_resized, use_container_width=True)
             st.markdown('<p class="caption">Original</p>', unsafe_allow_html=True)
 
         with c2:
             heatmap_img = mask_to_heatmap_image(mask)
-            st.image(heatmap_img, width='stretch')
+            st.image(heatmap_img, use_container_width=True)
             st.markdown(
-                f'<p class="caption">Mask  (max={mask.max():.2f}  '
-                f'mean={mask.mean():.2f})</p>',
+                f'<p class="caption">Mask  (max={mask.max():.2f} '
+                f'· mean={mask.mean():.2f})</p>',
                 unsafe_allow_html=True,
             )
 
         with c3:
             overlay = build_overlay(img_np, mask)
-            st.image(overlay, width='stretch')
-            st.markdown('<p class="caption">Overlay (red = high suspicion)</p>',
-                        unsafe_allow_html=True)
+            st.image(overlay, use_container_width=True)
+            st.markdown(
+                '<p class="caption">Overlay (red = high suspicion)</p>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown(f"*U-Net inference: {seg_time*1000:.0f} ms*")
         st.markdown("---")
@@ -516,7 +564,7 @@ def render_analysis(image: Image.Image):
     # ── LIME ─────────────────────────────────────────────────────
     if show_lime and LIME_AVAILABLE:
         st.markdown("#### 💡 LIME Explainability")
-        st.info("Running LIME — this may take 1–2 minutes depending on sample count.")
+        st.info("Running LIME — this may take 1–2 minutes.")
 
         with st.spinner(f"Running LIME with {lime_samples} samples…"):
             try:
@@ -529,16 +577,16 @@ def render_analysis(image: Image.Image):
                 lc1, lc2, lc3 = st.columns(3)
 
                 with lc1:
-                    st.image(img_np, width='stretch')
-                    st.markdown('<p class="caption">Original</p>',
-                                unsafe_allow_html=True)
+                    st.image(img_np, use_container_width=True)
+                    st.markdown(
+                        '<p class="caption">Original</p>',
+                        unsafe_allow_html=True,
+                    )
 
                 with lc2:
-                    boundary_img = mark_boundaries(
-                        lime_temp / 255.0, lime_mask_arr
-                    )
+                    boundary_img = mark_boundaries(lime_temp / 255.0, lime_mask_arr)
                     boundary_img = (boundary_img * 255).astype(np.uint8)
-                    st.image(boundary_img, width='stretch')
+                    st.image(boundary_img, use_container_width=True)
                     st.markdown(
                         f'<p class="caption">LIME regions → {lime_label}</p>',
                         unsafe_allow_html=True,
@@ -550,11 +598,10 @@ def render_analysis(image: Image.Image):
                     ax.axis("off")
                     fig.tight_layout(pad=0)
                     buf = io.BytesIO()
-                    fig.savefig(buf, format="png", bbox_inches="tight",
-                                pad_inches=0)
+                    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
                     plt.close(fig)
                     buf.seek(0)
-                    st.image(Image.open(buf), width='stretch')
+                    st.image(Image.open(buf), use_container_width=True)
                     st.markdown(
                         '<p class="caption">Key regions (green = supports prediction)</p>',
                         unsafe_allow_html=True,
@@ -608,17 +655,17 @@ elif mode == "🎥 Webcam (Experimental)":
     st.markdown("### Webcam — Real-Time Detection")
     st.warning(
         "Webcam mode runs best locally with a GPU. "
-        "Each frame is classified by ViT; the mask overlay is updated every 5 frames."
+        "ViT classifies every frame; U-Net mask updates every 5 frames."
     )
 
     run_cam = st.checkbox("▶ Start Webcam", value=False)
 
-    frame_placeholder = st.empty()
+    frame_placeholder  = st.empty()
     status_placeholder = st.empty()
 
-    cap        = cv2.VideoCapture(0)
-    frame_idx  = 0
-    last_mask  = None
+    cap       = cv2.VideoCapture(0)
+    frame_idx = 0
+    last_mask = None
 
     while run_cam:
         ret, frame = cap.read()
@@ -629,21 +676,22 @@ elif mode == "🎥 Webcam (Experimental)":
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img_pil   = Image.fromarray(frame_rgb)
 
-        # ── Classify every frame ──────────────────────────────
+        # Classify every frame
         label, conf, probs = classify(clf_model, img_pil)
 
-        # ── Segment every 5 frames (heavier) ─────────────────
+        # Segment every 5 frames (heavier)
         if frame_idx % 5 == 0 and show_mask:
             last_mask = segment(seg_model, img_pil)
-            last_mask = cv2.resize(last_mask,
-                                   (frame_rgb.shape[1], frame_rgb.shape[0]))
+            last_mask = cv2.resize(
+                last_mask, (frame_rgb.shape[1], frame_rgb.shape[0])
+            )
 
-        # ── Overlay mask if available ─────────────────────────
+        # Overlay mask
         display = frame_rgb.copy()
         if last_mask is not None and show_mask:
             display = build_overlay(display, last_mask)
 
-        # ── Draw label bar on frame ───────────────────────────
+        # Draw label bar directly on frame
         bar_color = (63, 185, 80) if label == "REAL" else (248, 81, 73)
         h, w      = display.shape[:2]
         cv2.rectangle(display, (0, 0), (w, 48), (13, 17, 23), -1)
@@ -657,16 +705,14 @@ elif mode == "🎥 Webcam (Experimental)":
             2,
         )
 
-        frame_placeholder.image(display, channels="RGB", width='stretch')
+        frame_placeholder.image(display, channels="RGB", use_container_width=True)
         status_placeholder.markdown(
-            f"Frame {frame_idx} | FAKE: {probs[0]*100:.1f}%  "
-            f"REAL: {probs[1]*100:.1f}%"
+            f"Frame {frame_idx} &nbsp;|&nbsp; "
+            f"FAKE: {probs[0]*100:.1f}%  &nbsp;  REAL: {probs[1]*100:.1f}%"
         )
 
         frame_idx += 1
-
-        # Yield to Streamlit so the checkbox state updates
-        time.sleep(0.03)
+        time.sleep(0.03)   # yield so Streamlit can update checkbox state
 
     cap.release()
 
